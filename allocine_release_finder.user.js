@@ -42,7 +42,8 @@ function closePreDbWhenDdosChallengeIsOk() {
   };
 
   closeWindowIfOk();
-  // Just by security if window if DOM is updated by JS
+
+  // Just in case that page refresh by scripting (not the case)
   setInterval(closeWindowIfOk, 250);
 }
 
@@ -148,7 +149,6 @@ async function allocineReleasesFinder() {
 }
 
 function preDbSearch(term) {
-  // callback onload it's sometimes called multiple time (maybe a bug)
   const baseUrl = `https://predb.me/?cats=movies&search=${encodeURIComponent(normalizeStr(term))}`;
 
   return new Promise((resolve, reject) =>
@@ -211,11 +211,12 @@ function parseReleasesWithOleoo(releases) {
 }
 
 function isSourceOk({ source }) {
-  // We consider that screener is not good enough, but it depends
+  // We consider here that screener source is not good enough
   return ['DVDRip', 'BDRip', 'HDRip', 'WEB-DL', 'DVD-R', 'BLURAY', 'PDTV', 'SDTV', 'HDTV'].includes(source);
 }
 
 function getBestFrenchTranslation(releases) {
+  // VFR > VOSTFR > OTHER
   return releases.reduce((acc, { language }) => {
     const isFrench = ['FRENCH', 'MULTI', 'TRUEFRENCH'].includes(language);
     const isSubFr = language === 'VOSTFR';
