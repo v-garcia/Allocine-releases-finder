@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name Allocine releases finder
 // @namespace Allocine scripts
-// @match http://www.allocine.fr/film/fichefilm_gen_cfilm=*
+// @match http://www.allocine.fr/film/*
 // @match https://predb.me/*#to-close
 // @grant GM_xmlhttpRequest
 // @grant GM_openInTab
 // @grant window.close
 // @connect https://predb.me
 // @require https://cdn.jsdelivr.net/gh/v-garcia/oleoo@b7d9fe652ba8dec5bc3afbcbf9ffcf0e7db810d1/src/index.js
+// @require https://cdn.jsdelivr.net/gh/Nycto/PicoModal/src/picoModal.js
 // ==/UserScript==
 
 const base64Images = {
@@ -29,8 +30,26 @@ const base64Images = {
 
 const carriageReturn = '\n';
 
+function limitPromiseDuration(prom, duration = 15000) {
+  return Promise.race([
+    prom,
+    new Promise((_, rej) => setTimeout(() => rej(`Promise has timed out (${duration} ms)`), duration))
+  ]);
+}
+
 function isOnPreDb() {
   return window.location.href.startsWith('https://predb.me/');
+}
+
+function appendMultipleChildren(element, childrensToAppend, prepend = false) {
+  const fnName = prepend ? 'prepend' : 'append';
+  for (let toInsert of childrensToAppend) {
+    if (prepend) {
+      element.insertBefore(toInsert, element.firstChild);
+    } else {
+      element.appendChild(toInsert);
+    }
+  }
 }
 
 function closePreDbWhenDdosChallengeIsOk() {
@@ -42,8 +61,7 @@ function closePreDbWhenDdosChallengeIsOk() {
   };
 
   closeWindowIfOk();
-
-  // Just in case that page refresh by scripting (not the case)
+  // Just by security if window if DOM is updated by JS
   setInterval(closeWindowIfOk, 250);
 }
 
@@ -58,6 +76,10 @@ function createImage(imgName, altName, title) {
   img.title = title;
   img.style = 'margin:5px 5px 0px 5px;';
   return img;
+}
+
+function normalizeStr(str) {
+  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 }
 
 function createImageLink(imgName, linkName, link) {
@@ -88,21 +110,17 @@ function getTorrentz2LinkElem(searchTerm) {
   );
 }
 
-function normalizeStr(str) {
-  return str.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+function getMovieTitleFromDetail() {
+  return getOriginalTitleFromDetail() || getFrenchTitleFromDetail();
 }
 
-function getMovieTitle() {
-  return getOriginalTitle() || getFrenchTitle();
-}
-
-function getFrenchTitle() {
+function getFrenchTitleFromDetail() {
   const frenchTitleElem = document.querySelector('.titlebar-title-lg');
   const frenchTitle = frenchTitleElem.innerHTML.trim();
   return frenchTitle;
 }
 
-function getOriginalTitle() {
+function getOriginalTitleFromDetail() {
   const objOriginalTitle = getMovieDetails().find(({ title }) => title === 'Titre original');
 
   return objOriginalTitle ? objOriginalTitle.value : null;
@@ -123,58 +141,159 @@ function quoteString(string) {
   return `"${string}"`;
 }
 
-function log(string) {
-  console.log(`allocine_release_finder: ${string}`);
+function log(string, type = 'log') {
+  console[type](`allocine_release_finder: ${string}`);
 }
 
-async function allocineReleasesFinder() {
-  log('Start main');
+function getTitleFromMovieItem(movieItemElem) {
+  return movieItemElem.querySelector('.meta-title a').innerText.trim();
+}
 
-  const currentMovieTitle = getMovieTitle();
+function getMovieIdFromMovieItem(movieItemElem) {
+  const linkElem = movieItemElem.querySelector('.meta-title a');
+  const allocineLink = linkElem.getAttribute('href');
+  const [fst, snd, allocineId] = allocineLink.match(/(_cfilm=)(\d+)/);
+  return Number(allocineId);
+}
 
-  log(`Looking for movie '${currentMovieTitle}' on predb.me`);
-  const releasesResponse = await preDbSearch(quoteString(currentMovieTitle));
+async function executeScriptOnMovieDetail() {
+  log('Start script for movie detail');
 
-  log(`${releasesResponse.length} releases found on preDb`);
+  const currentMovieTitle = getMovieTitleFromDetail();
+
+  const infosIconsElem = getScriptButtonsElem(currentMovieTitle);
+
+  document.querySelector('.meta-body').appendChild(infosIconsElem);
+}
+
+function executeScriptOnMoviesList() {
+  log('Start script for movie detail');
+
+  const movieElems = Array.from(document.querySelectorAll('ol li.mdl, ul li.mdl')).filter(x =>
+    x.querySelector('[data-entity-id]')
+  );
+
+  if (!movieElems.length) {
+    log('No movies found in this movie list');
+    return;
+  }
+
+  movieElems.forEach(executeScriptOnMovieItem);
+}
+
+async function executeScriptOnMovieItem(targetElement) {
+  const movieTitleFr = getTitleFromMovieItem(targetElement);
+  const movieId = getMovieIdFromMovieItem(targetElement);
+
+  const movieOriginalTitle = await getMovieOriginalTitle(movieTitleFr, movieId);
+
+  const scriptButtonsElem = getScriptButtonsElem(movieOriginalTitle);
+
+  targetElement.querySelector('.meta').appendChild(scriptButtonsElem);
+
+  if (movieTitleFr !== movieOriginalTitle) {
+    log(`'${movieTitleFr}' original title is '${movieOriginalTitle}'`);
+  }
+}
+
+async function getAutoCompleteResults(term) {
+  // No need to use GM_xmlhttpRequest for query here as it's a same origin query
+  const response = await fetch(`http://essearch.allocine.net/fr/autocomplete?q=${encodeURIComponent(term)}`);
+
+  if (response.status !== 200) {
+    throw `Bad response status why searching '${term}' in autocomplete`;
+  }
+
+  const jsonResponse = await response.json();
+  return jsonResponse;
+}
+
+async function getMovieAutoCompleteInfo(term, movieId) {
+  const autoCompleRes = await getAutoCompleteResults(term);
+
+  const movieInfo = autoCompleRes.find(({ id }) => id === movieId);
+
+  return movieInfo;
+}
+
+async function getMovieOriginalTitle(term, movieId) {
+  const { title2: originalTitle } = (await getMovieAutoCompleteInfo(term, movieId)) || {};
+  return originalTitle;
+}
+
+function getScriptButtonsElem(title) {
+  const iconsCtnElem = document.createElement('span');
+
+  appendMultipleChildren(iconsCtnElem, getDownloadButtonElems(title));
+
+  getDownloadInfoElems(title)
+    .then(els => {
+      appendMultipleChildren(iconsCtnElem, els, true);
+    })
+    .catch(err => {
+      console.error(err);
+    });
+
+  return iconsCtnElem;
+}
+
+async function searchForReleases(title) {
+  const releasesResponse = await limitPromiseDuration(preDbSearch(quoteString(title)));
+  log(`${releasesResponse.length} releases found on preDb for '${title}'`);
 
   const parsedReleases = orderReleaseByInterest(
     addCustomPropertiesToReleases(parseReleasesWithOleoo(releasesResponse))
   );
 
-  const infosIconsElem = getInfoIconsElem(parsedReleases);
-
-  document.querySelector('.meta-body').appendChild(infosIconsElem);
-
-  console.log(parsedReleases);
+  return parsedReleases;
 }
 
-function preDbSearch(term) {
+function preDbSearch(term, triesLeft = 3) {
   const baseUrl = `https://predb.me/?cats=movies&search=${encodeURIComponent(normalizeStr(term))}`;
 
-  return new Promise((resolve, reject) =>
+  if (triesLeft < 1) {
+    const err = `Max preDb tries exceeded for '${term}'`;
+    log(err);
+    return Promise.reject(err);
+  }
+
+  return new Promise((resolve, reject) => {
+    const redoSearch = () => preDbSearch(term, --triesLeft).then(resolve, reject);
+    log(`Looking for movie '${term}' on predb.me (${triesLeft} tries left)`);
+
     GM_xmlhttpRequest({
       method: 'GET',
       url: `${baseUrl}&rss=1`,
       headers: { Accept: 'text/html' },
-      onload: ({ status, responseText, responseXML }) => {
+      onerror: () => {
+        const redoIn = 1500;
+        log(`OnError callback thrown for '${term}', redoing in ${redoIn}ms`, 'warn');
+        window.setTimeout(redoSearch, redoIn);
+      },
+      onload: response => {
+        const { status, responseText, responseXML } = response;
         if (status === 503 && responseText.indexOf('DDoS protection by Cloudflare') > -1) {
           log('Trying to bypass Ddos protect by cloud fare');
 
           const openedTab = GM_openInTab(`${baseUrl}#to-close`, { active: false, insert: true });
           // One the tab is closed, the Cloud Fare challenge has been done
-          openedTab.onclose = () => {
-            preDbSearch(term)
-              .then(resolve)
-              .catch(reject);
-          };
+          openedTab.onclose = redoSearch;
+          return;
+        }
+        if (status === 503 && responseText.indexOf('Service Temporarily Unavailable') > -1) {
+          const redoIn = 1500;
+          log(`Too much preDb query, redoing in ${redoIn}ms`, 'warn');
+          window.setTimeout(redoSearch, redoIn);
           return;
         }
 
         // Check status code
         if (status !== 200) {
-          reject('Unexpected status');
+          reject(`Unexpected status ${status} for an preDb.me search`, 'error');
           return;
         }
+
+        log(`Success for movie '${term}' on predb.me (${triesLeft} tries left)`);
 
         // Try to parse response
         try {
@@ -189,8 +308,8 @@ function preDbSearch(term) {
 
         resolve(releaseItems);
       }
-    })
-  );
+    });
+  });
 }
 
 function orderReleaseByInterest(releases) {
@@ -211,12 +330,11 @@ function parseReleasesWithOleoo(releases) {
 }
 
 function isSourceOk({ source }) {
-  // We consider here that screener source is not good enough
+  // We consider that screener is not good enough, but it depends
   return ['DVDRip', 'BDRip', 'HDRip', 'WEB-DL', 'DVD-R', 'BLURAY', 'PDTV', 'SDTV', 'HDTV'].includes(source);
 }
 
 function getBestFrenchTranslation(releases) {
-  // VFR > VOSTFR > OTHER
   return releases.reduce((acc, { language }) => {
     const isFrench = ['FRENCH', 'MULTI', 'TRUEFRENCH'].includes(language);
     const isSubFr = language === 'VOSTFR';
@@ -242,14 +360,14 @@ function getNotAvailableImgElem() {
 }
 
 function getFrenchLangElem() {
-  return createImage('frenchLang', 'French lang available', 'French version (or MULTI) available for this release');
+  return createImage('frenchLang', 'French lang available', 'French version (or MULTI) available for this movie');
 }
 
 function getFrenchStLangElem() {
   return createImage(
     'frenchLangSt',
     'Fr subtitles available',
-    'Release with french subtitles available for  this release'
+    'Release with french subtitles available for this movies'
   );
 }
 
@@ -262,7 +380,77 @@ function getReleaseImgElem(releases) {
     ? `${releases.length} releases has been found ${carriageReturn}`
     : `${releases.length} releases has been found ${carriageReturn}/!\\ But source qualities are poor${carriageReturn}`;
 
-  return createImage(pictureToChoose, imgAlt, title + concatNames);
+  const onReleaseImageClick = evt => {
+    evt.preventDefault();
+    evt.stopPropagation();
+    showReleaseInfoModal(releases);
+  };
+
+  const btnLink = document.createElement('a');
+  btnLink.setAttribute('href', 'release-modal');
+  btnLink.addEventListener('click', onReleaseImageClick);
+
+  const releasesInfoImg = createImage(pictureToChoose, imgAlt, title + concatNames);
+  releasesInfoImg.addEventListener('click', onReleaseImageClick);
+  btnLink.appendChild(releasesInfoImg);
+  return btnLink;
+}
+
+function getReleaseListItemModal(release) {
+  const { original } = release;
+  const liElem = document.createElement('li');
+
+  const iconsLang = getLanguageImageElem([release]);
+
+  if (iconsLang) {
+    //iconsLang.setAttribute('style', 'height:1em;width:1em;margin:0;');
+    liElem.appendChild(iconsLang);
+  } else {
+    liElem.style.paddingLeft = '42px';
+  }
+
+  const downloadButtons = getDownloadButtonElems(original);
+
+  appendMultipleChildren(liElem, downloadButtons);
+
+  const releaseName = document.createElement('span');
+  releaseName.setAttribute('style', 'display:inline-block;height:2em;padding-left:.25em;max-width:calc(100% - 85px);');
+  releaseName.innerText = original;
+  liElem.appendChild(releaseName);
+
+  return liElem;
+}
+
+function showReleaseInfoModal(releases, btn) {
+  const [{ title: movieTitle }] = releases;
+  const modalContentElem = document.createElement('div');
+
+  const modalTitleElem = document.createElement('h1');
+  modalTitleElem.innerText = `${releases.length} releases found for '${movieTitle}'`;
+  modalTitleElem.setAttribute('style', 'margin-bottom:1em;');
+  modalContentElem.appendChild(modalTitleElem);
+
+  const modalListElem = document.createElement('ul');
+
+  appendMultipleChildren(modalListElem, releases.map(getReleaseListItemModal));
+
+  modalContentElem.appendChild(modalListElem);
+
+  picoModal({
+    content: modalContentElem
+  })
+    .afterClose(function(modal) {
+      modal.destroy();
+    })
+    .show();
+}
+
+function isShowingMovieList() {
+  return Boolean(document.querySelector('ol li.mdl, ul li.mdl'));
+}
+
+function isShowingMovieDetail() {
+  return /^http(s)?:\/\/www.allocine.fr\/film\/fichefilm*/.test(window.location.href);
 }
 
 function getLanguageImageElem(releases) {
@@ -279,36 +467,37 @@ function getLanguageImageElem(releases) {
   return null;
 }
 
-function getInfoIconsElem(releases) {
-  //Declare container
-  const iconsCtnElem = document.createElement('span');
+function getDownloadButtonElems(title) {
+  return [getYggLinkElem(title), getTorrentz2LinkElem(title)];
+}
 
-  // If no releas found on preDb show appropriate icon
-  if (!releases.length) {
-    iconsCtnElem.appendChild(getNotAvailableImgElem());
-    return iconsCtnElem;
+async function getDownloadInfoElems(title) {
+  try {
+    var releases = await searchForReleases(title);
+  } catch (ex) {
+    throw ex;
+    log(`PreDbSearch failled for '${title}', only torrents links will be displayed`);
+    return [];
   }
 
-  // Show preDb releases infos
-  iconsCtnElem.appendChild(getReleaseImgElem(releases));
+  if (!releases.length) {
+    return [getNotAvailableImgElem()];
+  }
 
-  // Show if it has fr versions
+  const iconReleases = getReleaseImgElem(releases);
   const iconsLang = getLanguageImageElem(releases);
-  iconsLang && iconsCtnElem.appendChild(iconsLang);
 
-  const [{ title: movieTitle }] = releases;
-
-  // Add ygg torrent search link
-  iconsCtnElem.appendChild(getYggLinkElem(movieTitle));
-
-  // Add torrentz2 link elem
-  iconsCtnElem.appendChild(getTorrentz2LinkElem(movieTitle));
-
-  return iconsCtnElem;
+  return iconsLang ? [iconsLang, iconReleases] : [iconReleases];
 }
 
 if (isOnPreDb()) {
   closePreDbWhenDdosChallengeIsOk();
 } else {
-  allocineReleasesFinder();
+  if (isShowingMovieDetail()) {
+    executeScriptOnMovieDetail();
+  } else if (isShowingMovieList()) {
+    executeScriptOnMoviesList();
+  } else {
+    log('Script cannot be applied on this page');
+  }
 }
