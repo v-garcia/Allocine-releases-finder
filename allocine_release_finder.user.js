@@ -96,7 +96,7 @@ function getYggLinkElem(searchTerm) {
   return createImageLink(
     'yggTorrent',
     `Search '${searchTerm}' on yggTorrent`,
-    `https://www6.yggtorrent.to/engine/search?category=2145&sub_category=all&name=${encodeURIComponent(
+    `https://www2.yggtorrent.ch/engine/search?category=2145&sub_category=all&name=${encodeURIComponent(
       searchTerm
     )}&do=search`
   );
